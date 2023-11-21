@@ -11,7 +11,7 @@ from sklearn.utils.validation import check_is_fitted
 from .base import BaseOptimizer
 
 
-class STLSQ(BaseOptimizer):
+class adam_STLSQ(BaseOptimizer):
     """Sequentially thresholded least squares algorithm.
     Defaults to doing Sequentially thresholded Ridge regression.
 
@@ -41,6 +41,15 @@ class STLSQ(BaseOptimizer):
     max_iter : int, optional (default 20)
         Maximum iterations of the optimization algorithm.
 
+    mom_memory : float, optional (default 0.9)
+        0<=mom_memory<=1 is used to calculate the momentum at each time step of
+        sequential thresholding as mom_k =
+        mom_memory*(mom_k-1) + (1-mom_memory)*coeff_k
+
+    mom_init_iter : int, optional (default 1)
+        Iteration number from which momentum is calculated. Until this iteration,
+        momentum = coeff.
+
     ridge_kw : dict, optional (default None)
         Optional keyword arguments to pass to the ridge regression.
 
@@ -64,6 +73,19 @@ class STLSQ(BaseOptimizer):
         Indices to threshold and perform ridge regression upon.
         If None, sparse thresholding and ridge regression is applied to all
         indices.
+
+    use_mom : bool, optional (default True)
+        Use momentum method for sequential thresholding. False case is not implemented yet,
+        but will be same as regular STLS
+
+    mom_inplace : bool, optional (default True)
+        If true, coefficient at each iteration of STLS will be repalced with momentum.
+
+    variable_thresh : bool, optional (default False)
+        If true, a threshold vector will be used for thresholding coeffcieints in STLS.
+
+    threshold_vect : list, optional (default []])
+        Initial treshold vector used for variable thresholding. Empty list by default.
 
     Attributes
     ----------
@@ -104,6 +126,8 @@ class STLSQ(BaseOptimizer):
         threshold=0.1,
         alpha=0.05,
         max_iter=20,
+        mom_memory = 0.9,
+        mom_init_iter = 1,
         ridge_kw=None,
         normalize_columns=False,
         copy_X=True,
@@ -111,6 +135,10 @@ class STLSQ(BaseOptimizer):
         verbose=False,
         sparse_ind=None,
         unbias=True,
+        use_mom = True,
+        mom_inplace = True,
+        variable_thresh = False,
+        threshold_vect = []
     ):
         super().__init__(
             max_iter=max_iter,
@@ -131,21 +159,49 @@ class STLSQ(BaseOptimizer):
         self.verbose = verbose
         self.sparse_ind = sparse_ind
 
+        self.mom_memory = mom_memory
+        self.mom_inplace = mom_inplace
+        self.mom_init_iter = mom_init_iter
+        if use_mom:
+            self.mom_history = []
+            assert mom_init_iter >= 1
+
+        self.variable_thresh = variable_thresh
+        self.threshold_vect = threshold_vect
+
+
     def _sparse_coefficients(
-        self, dim: int, ind_nonzero: np.ndarray, coef: np.ndarray, threshold: float
+        self, dim: int, ind_nonzero: np.ndarray, coef: np.ndarray, threshold: list
     ) -> (np.ndarray, np.ndarray):
         """Perform thresholding of the weight vector(s) (on specific indices
-        if ``self.sparse_ind`` is not None)"""
+        if ``self.sparse_ind`` is not None)
+        Note threshold is a list of len dim.
+        """
         c = np.zeros(dim)
         c[ind_nonzero] = coef
         #Manu Note: this is where the thresholding is happening, we an add the adaptive
+        # thresholding step here.
+        assert dim == len(threshold), ("Length of threshold vector not same as the "
+                                       "length of the feature library")
+
+
         big_ind = np.abs(c) >= threshold
+
         if self.sparse_ind is not None:
             nonsparse_ind_mask = np.ones_like(ind_nonzero)
             nonsparse_ind_mask[self.sparse_ind] = False
             big_ind = big_ind | nonsparse_ind_mask
         c[~big_ind] = 0
         return c, big_ind
+
+    def _updated_momentum(
+        self, dim: int, ind_nonzero: np.ndarray, coef: np.ndarray, prev_mom: np.ndarray) -> np.ndarray:
+        """Calculate the momentum of parameters"""
+        c = np.zeros(dim)
+        c[ind_nonzero] = coef
+
+        mom_array = self.mom_memory*prev_mom + ((1 - self.mom_memory)*c)
+        return mom_array
 
     def _regress(self, x: np.ndarray, y: np.ndarray, dim: int, sparse_sub: np.ndarray):
         """Perform the ridge regression (on specific indices if
@@ -205,6 +261,9 @@ class STLSQ(BaseOptimizer):
         n_features_selected = np.sum(ind)
         sparse_sub = [np.array(self.sparse_ind)] * y.shape[1]
 
+        self.threshold_vect = np.array(self.threshold_vect) if len(self.threshold_vect) > 0 \
+            else self.threshold*np.ones(n_features)
+
         # Print initial values for each term in the optimization
         if self.verbose:
             row = [
@@ -229,6 +288,9 @@ class STLSQ(BaseOptimizer):
                 break
 
             optvar = np.zeros((n_targets, n_features))
+            #Defining momentum vector
+            opt_mom = np.zeros((n_targets, n_features))
+
             for i in range(n_targets):
                 if np.count_nonzero(ind[i]) == 0:
                     warnings.warn(
@@ -239,9 +301,23 @@ class STLSQ(BaseOptimizer):
                 coef_i = self._regress(
                     x[:, ind[i]], y[:, i], np.count_nonzero(ind[i]), sparse_sub[i]
                 )
-                coef_i, ind_i = self._sparse_coefficients(
-                    n_features, ind[i], coef_i, self.threshold
-                )
+                #Calculating momentum
+                mom_i = self._updated_momentum(n_features, ind[i], coef_i, self.mom_history[-1][i]) \
+                    if k >= self.mom_init_iter else np.copy(coef_i)
+
+                if self.mom_inplace:
+
+                    coef_i, ind_i = self._sparse_coefficients(
+                        n_features, np.arange(n_features), mom_i, self.threshold_vect
+                    )
+                    mom_i = np.copy(coef_i)
+                else:
+                    coef_i, ind_i = self._sparse_coefficients(
+                        n_features, ind[i], coef_i, self.threshold_vect
+                    )
+                # coef_i, ind_i = self._sparse_coefficients(
+                #     n_features, ind[i], coef_i, self.threshold
+                #     )
                 if self.sparse_ind is not None:
                     vals_to_remove = np.intersect1d(
                         self.sparse_ind, np.where(coef_i == 0)
@@ -250,9 +326,11 @@ class STLSQ(BaseOptimizer):
                         self.sparse_ind, vals_to_remove
                     )
                 optvar[i] = coef_i
+                opt_mom[i] = mom_i
                 ind[i] = ind_i
 
             self.history_.append(optvar)
+            self.mom_history.append(opt_mom)
             if self.verbose:
                 R2 = np.sum((y - np.dot(x, optvar.T)) ** 2)
                 L2 = self.alpha * np.sum(optvar**2)
